@@ -313,9 +313,12 @@ import Control.Applicative (Alternative (..))
 import Control.Exception (IOException)
 import Control.Monad (when, MonadPlus)
 import Control.Monad.Trans 
+import Control.Monad.Reader (ReaderT)
 import Control.Monad.Catch (MonadCatch (catch), MonadThrow (throwM))
 
 class (MonadPlus m, MonadIO m) => MonadRequest m
+
+instance MonadRequest m => MonadRequest (ReaderT a m)
 
 newtype RequestT m a = RequestT (m (Maybe a))
 
