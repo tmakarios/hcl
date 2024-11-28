@@ -27,4 +27,4 @@ mplusTest (label, x, y, expect) = TestLabel label $ TestCase $ do
   val <- runRequest $ x `mplus` y
   assertEqual "" expect val
 
-err = Request $ fail ""
+err = RequestT $ fail ""

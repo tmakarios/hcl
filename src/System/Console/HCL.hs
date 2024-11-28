@@ -283,8 +283,10 @@ Several examples are included with the library, including a hangman game you can
 
 module System.Console.HCL 
 (
+-- * MonadRequest class
+  MonadRequest (..),
 -- * Request type and related functions
-  Request (..),
+  RequestT (..), Request,
   runRequest, execReq, reqIO, reqLiftMaybe, makeReq,
 -- * Request building blocks
   reqResp, reqInteger, reqInt, reqRead, reqChar, reqPassword,
@@ -313,20 +315,28 @@ import Control.Monad (when, MonadPlus)
 import Control.Monad.Trans 
 import Control.Monad.Catch (MonadCatch (catch), MonadThrow (throwM))
 
+class (MonadPlus m, MonadIO m) => MonadRequest m
+
+newtype RequestT m a = RequestT (m (Maybe a))
+
+runRequestT :: RequestT m a -> m (Maybe a)
+runRequestT (RequestT req) = req
+
 {- |
 The @Request@ data type represents a value requested interactively. The
 request may have failed or been no response, in which case the request
 fails. Otherwise, the request holds the response given. -}
-newtype Request a = Request (IO (Maybe a))
+type Request a = RequestT IO a
 
 {- |
 Runs a request, throws away the result, and
 returns an @IO@ type (rather than a @Request@). Useful when a request
 should just be run and we don't care about the result. Generally used at the top
 level to evaluate a request in main. -}
-execReq :: Request a -- ^ Request to run.
-           -> IO () -- ^ No meaningful value is returned.
-execReq (Request req) =
+execReq :: Monad m
+           => RequestT m a -- ^ Request to run.
+           -> m () -- ^ No meaningful value is returned.
+execReq (RequestT req) =
   do
     result <- req
     maybe (return ()) (\_ -> return ()) result
@@ -334,169 +344,176 @@ execReq (Request req) =
 -- | Extracts the value from a given request.
 runRequest :: Request a  -- ^ The request to evaluate.
               -> IO (Maybe a) -- ^ Result of the request.
-runRequest (Request r) = r
+runRequest = runRequestT
 
 {- |
 Because we have defined @'Request'@ as @"Applicative"@,
 we must also define it as @"Functor"@. -}
-instance Functor Request where
-  fmap = reqLift
+instance Functor m => Functor (RequestT m) where
+  fmap f (RequestT req) = RequestT $ fmap (fmap f) req
 
 {- |
 Because we have defined @'Request'@ as @"Monad"@,
 we must also define it as @"Applicative"@. -}
-instance Applicative Request where
-  pure = makeReq
-  f <*> x = f `andMaybe` \f' ->
-    fmap f' x
+instance Applicative m => Applicative (RequestT m) where
+  pure = RequestT . pure . Just
+  (RequestT f) <*> (RequestT x) = RequestT $ (fmap (<*>) f) <*> x
 
 {- |
 @'Request'@ behavior as a @"Monad"@ all bind operations fail
 afterwards. Thus, when one request fails, all subsequent requests
 automatically fail. -}
-instance Monad Request where
-  f >>= g = f `andMaybe` g
+instance Monad m => Monad (RequestT m) where
+  (RequestT req) >>= next = RequestT $ do
+    v <- req
+    case v of
+      Nothing -> return Nothing
+      Just x -> runRequestT $ next x
 
 {- |
 Request behavior as a @MonadFail@ covers failure - when
 a request results in @Nothing@, -}
-instance MonadFail Request where
-  fail _ = reqFail
+instance Monad m => MonadFail (RequestT m) where
+  fail _ = RequestT $ return Nothing
 
 {- |
 Because we have defined @'Request'@ as @"MonadPlus"@, we must also
 define it as @"Alternative"@. -}
-instance Alternative Request where
-  empty = reqFail
-  (<|>) = reqCont
+instance (MonadCatch m, MonadIO m) => Alternative (RequestT m) where
+  empty = fail ""
+  (RequestT req) <|> (RequestT cont) =  RequestT $ do
+    req' <- catch req (\(_ :: IOError) -> return Nothing)
+    case req' of
+      Nothing -> cont
+      Just x  -> return $ Just x
 
 {- |
 @'Request'@ behaviour as a @"MonadPlus"@ allows for successive fallback
 requests to be used on failure. -}
-instance MonadPlus Request
+instance (MonadCatch m, MonadIO m) => MonadPlus (RequestT m)
 
 {- |
 Takes a value and makes it into a request. Should
 not be an @"IO" ("Maybe" a)@ type value, unless
 multiply nested values is desired. -}
-makeReq :: a -- ^ The value to turn into a Request.
-           -> Request a -- ^ The value as a Request.
-makeReq = Request . return . Just
+makeReq :: MonadRequest m
+           => a -- ^ The value to turn into a Request.
+           -> m a -- ^ The value as a Request.
+makeReq = pure
 
 {- |
 If the request given results in @Nothing@, @Nothing@ is
 returned. Otherwise, the value held in the Just constructor is passed
 to the function given. This is essentially the bind operation. -}
-andMaybe :: Request a -- ^ Request to try.
-            -> (a -> Request b) -- ^ Function which processes the result of the previous request and returns a new request.
-            -> Request b -- ^ The new request returned.
-andMaybe (Request req) next =
-  Request $ do
-    v <- req
-    case v of
-        Nothing -> return Nothing
-        Just x  -> runRequest $ next x
+andMaybe :: MonadRequest m
+            => m a -- ^ Request to try.
+            -> (a -> m b) -- ^ Function which processes the result of the previous request and returns a new request.
+            -> m b -- ^ The new request returned.
+andMaybe = (>>=)
 
 -- | Allow the Request type to use IO operations.
-instance MonadIO Request where
-  liftIO = reqIO
+instance (MonadCatch m, MonadIO m) => MonadIO (RequestT m) where
+  liftIO io = RequestT $ catch (fmap Just $ liftIO io) $
+    \(_ :: IOException) -> return Nothing
 
 {- |
 Allows @"IO"@ operations in the @Request@ type. If the @"IO"@
 operation throws an @"IOError", the resulting @'Request'@ will return
 @Nothing@.  Same as @liftIO@ in "MonadIO" class (in
 @Control.Monad.Trans@ module) -}
-reqIO :: IO a -- ^ IO action to perform
-         -> Request a -- ^ Result of the IO action, as a Request.
-reqIO io = Request $ catch (fmap Just io) $
-  \(_ :: IOException) -> return Nothing
+reqIO :: MonadRequest m
+         => IO a -- ^ IO action to perform
+         -> m a -- ^ Result of the IO action, as a Request.
+reqIO = liftIO
+
+instance (MonadCatch m, MonadIO m) => MonadRequest (RequestT m)
 
 -- | Allow throwing exceptions compatible with the exceptions package
-instance MonadThrow Request where
-  throwM = Request . throwM
+instance MonadThrow m => MonadThrow (RequestT m) where
+  throwM = RequestT . throwM
 
 -- | Allow catching exceptions compatible with the exceptions package
-instance MonadCatch Request where
+instance MonadCatch m => MonadCatch (RequestT m) where
   catch happy exceptional =
-    Request $ catch (runRequest happy) $ runRequest . exceptional
+    RequestT $ catch (runRequestT happy) $ runRequestT . exceptional
 
 {- |
 Lifts a @"Maybe" a@ into a @'Request' a@. -}
-reqLiftMaybe :: Maybe a -- ^ the value to lift
-                -> Request a -- ^ the resulting 'Request'
-reqLiftMaybe = Request . return
+reqLiftMaybe :: MonadRequest m
+                => Maybe a -- ^ the value to lift
+                -> m a -- ^ the resulting 'Request'
+reqLiftMaybe = maybe empty pure
 
 {- |
 The basic request - get a string from the user. If a newline or all whitespace
 is entered, the request is assumed to be a failure. -}
 -- Read a string from the user.
-reqResp :: Request String
+reqResp :: MonadRequest m => m String
 reqResp =
-  Request $
   do
-    val <- getLine
+    val <- liftIO getLine
     if all isSpace val
-     then return Nothing
-     else return $ Just val
+     then empty
+     else pure val
 
 {- |
 Gets an @"Integer"@ from the user. If the value entered cannot be converted,
 the request fails. -}
-reqInteger :: Request Integer
+reqInteger :: MonadRequest m => m Integer
 reqInteger = reqRead reqResp
 
 {- |
 Gets an @"Int"@ from the user. If the value entered cannot be converted, the
 request fails. -}
-reqInt :: Request Int
+reqInt :: MonadRequest m => m Int
 reqInt = reqRead reqResp
 
 {- |
 Uses @"reads"@ to process a request. If the value cannot be parsed,
 fails. Otherwise, returns the value parsed. -}
-reqRead :: (Read a) => Request String -- ^ A request that returns a string (generally 'reqResp'), which will then be parsed.
-           -> Request a -- ^ The value parsed.
+reqRead :: (MonadRequest m, Read a)
+           => m String -- ^ A request that returns a string (generally 'reqResp'), which will then be parsed.
+           -> m a -- ^ The value parsed.
 reqRead req =
   req `andMaybe` \val ->
-    Request $
     do
       case reads val of
-        []          -> return Nothing
-        ((v, _):[]) -> return $ Just v
-        _           -> return Nothing
+        ((v, _):[]) -> pure v
+        _           -> empty
 
 {- |
 @'reqChar'@ requests a single character. Unlike other @'Request'@s, it
 does not wait for the user to hit enter; it simply returns the first
 keystroke. -}
-reqChar :: Request Char
-reqChar = Request $ do
-  mode <- hGetBuffering stdin
-  hSetBuffering stdin NoBuffering
-  val <- getChar
-  when (val /= '\n') $ putStrLn ""
-  hSetBuffering stdin mode
-  return $ Just val
+reqChar :: MonadRequest m => m Char
+reqChar = do
+  mode <- liftIO $ hGetBuffering stdin
+  liftIO $ hSetBuffering stdin NoBuffering
+  val <- liftIO getChar
+  when (val /= '\n') $ liftIO $ putStrLn ""
+  liftIO $ hSetBuffering stdin mode
+  pure val
 
 {- |
 @'reqPassword'@ works like @'reqResp'@ except that it does not echo
 the user's input to standard output. -}
-reqPassword :: Request String
-reqPassword = Request $ do
-  echo <- hGetEcho stdin
-  hSetEcho stdin False
-  val <- runRequest reqResp
-  putStrLn ""
-  hSetEcho stdin echo
+reqPassword :: MonadRequest m => m String
+reqPassword = do
+  echo <- liftIO $ hGetEcho stdin
+  liftIO $ hSetEcho stdin False
+  val <- reqResp
+  liftIO $ putStrLn ""
+  liftIO $ hSetEcho stdin echo
   return val
 
 {- |
 @&&@ operator for requests (with failure). Behaves similarly, including
 "short-circuit" behavior. If either condition fails, the entire @'Request'@
 fails. -}
-andReq :: Request Bool -- ^ Left boolean value.
-          -> Request Bool -- ^ Right boolean value.
-          -> Request Bool -- ^ Result value.
+andReq :: MonadRequest m
+          => m Bool -- ^ Left boolean value.
+          -> m Bool -- ^ Right boolean value.
+          -> m Bool -- ^ Result value.
 andReq left right = reqIf left
   right
   (return False)
@@ -505,23 +522,26 @@ andReq left right = reqIf left
 @||@ operator for requests (with failure). Behaves similarly, including
 "short-circuit" behavior. If either condition fails, the entire @Request@
 fails. -}
-orReq :: Request Bool -- ^ Left boolean value.
-         -> Request Bool -- ^ Right boolean value.
-         -> Request Bool -- ^ Result value.
+orReq :: MonadRequest m
+         => m Bool -- ^ Left boolean value.
+         -> m Bool -- ^ Right boolean value.
+         -> m Bool -- ^ Result value.
 orReq left right = reqIf left
     (return True)
     right
 
 -- | not operator for requests.
-notReq :: Request Bool -- ^ Request to evaluate.
-          -> Request Bool -- ^ Result value.
+notReq :: MonadRequest m
+          => m Bool -- ^ Request to evaluate.
+          -> m Bool -- ^ Result value.
 notReq = fmap not
 
 -- | If statement for requests. 
-reqIf :: Request Bool -- ^ The test to apply
-         -> Request a -- ^ Request to evaluate if test is true.
-         -> Request a -- ^ Request to evaluate if test if false.
-         -> Request a -- ^ Result.
+reqIf :: MonadRequest m
+         => m Bool -- ^ The test to apply
+         -> m a -- ^ Request to evaluate if test is true.
+         -> m a -- ^ Request to evaluate if test if false.
+         -> m a -- ^ Result.
 reqIf test thenCase elseCase = do
   cond <- test
   if cond
@@ -529,27 +549,27 @@ reqIf test thenCase elseCase = do
     else elseCase
 
 -- | Takes a value and makes it into a request. 
-reqConst :: a -- ^ Value to make into a request.
-            -> Request a -- ^ Result.
+reqConst :: MonadRequest m
+            => a -- ^ Value to make into a request.
+            -> m a -- ^ Result.
 reqConst = return
 
 -- | Lifts a one-argument function into @'Request'@ types.
-reqLift :: (a -> b) -- ^ Function to lift.
-           -> Request a -- ^ Argument to function.
-           -> Request b -- ^ Result.
-reqLift f req =
-  do
-    reqVal <- req
-    return (f reqVal)
+reqLift :: MonadRequest m
+           => (a -> b) -- ^ Function to lift.
+           -> m a -- ^ Argument to function.
+           -> m b -- ^ Result.
+reqLift = fmap
 
 {- |
 Lifts a two argument function into @'Request'@ types. The arguments to
 the function are evaluated in order, from left to right, since the
 @'Request'@ @"Monad"@ imposes sequencing. -}
-reqLift2 :: (a -> b -> c) -- ^ Function to lift.
-            -> Request a -- ^ First argument to function.
-            -> Request b -- ^ Second argument to function.
-            -> Request c -- ^ Result.
+reqLift2 :: MonadRequest m
+            => (a -> b -> c) -- ^ Function to lift.
+            -> m a -- ^ First argument to function.
+            -> m b -- ^ Second argument to function.
+            -> m c -- ^ Result.
 reqLift2 f left right =
   do
     leftVal <- left
@@ -560,9 +580,10 @@ reqLift2 f left right =
 Returns true if the user answer @y@ or @Y@. Allows
 a default to be specified, and allows failure if
 no default is given. -}
-reqAgree :: Maybe Bool -- ^ Default value (if any).
-            -> Request String -- ^ Request which gets a string (usually @'reqResp'@).
-            -> Request Bool -- ^ Result.
+reqAgree :: MonadRequest m
+            => Maybe Bool -- ^ Default value (if any).
+            -> m String -- ^ Request which gets a string (usually @'reqResp'@).
+            -> m Bool -- ^ Result.
 reqAgree def req =
   (req >>= f) <|> reqLiftMaybe def where
   f x = case dropWhile isSpace $ map toLower x of
@@ -571,15 +592,16 @@ reqAgree def req =
     _       -> reqFail
 
 -- | Automatic failure. Useful in menus to quit or return to the previous menu.
-reqFail :: Request a
-reqFail = Request $ return Nothing
+reqFail :: MonadRequest m => m a
+reqFail = empty
 
 {- |
 Takes a request and guarantees a value will be
 returned. That is, the request is repeated until a
 valid (i.e. not @Nothing@) response is returned. -}
-required :: Request a -- ^ Request to evaluate.
-            -> Request a -- ^ Result.
+required :: MonadRequest m
+            => m a -- ^ Request to evaluate.
+            -> m a -- ^ Result.
 required req = req <|> required req
 
 {- |
@@ -589,10 +611,11 @@ function either returns the default if the request value is @Nothing@
 or an @"IOError"@ is thrown, or it applies the function given to the
 value of the request and returns it.
 -}
-reqMaybe :: Request a -- ^ Request to evaluate.
-            -> Request b -- ^ Default value.
-            -> (a -> Request b) -- ^ Function to map b to Request a.
-            -> Request b -- ^ Result.
+reqMaybe :: MonadRequest m
+            => m a -- ^ Request to evaluate.
+            -> m b -- ^ Default value.
+            -> (a -> m b) -- ^ Function to map b to Request a.
+            -> m b -- ^ Result.
 reqMaybe  req def f = (req >>= f) <|> def
 
 {- |
@@ -600,9 +623,10 @@ Runs the request while the condition given holds, then returns the
 first result where it doesn't. Good for verification. If either
 request or condition return @Nothing@ at any point, the reault will
 also be @Nothing@. -}
-reqWhile :: (a -> Request Bool) -- ^ the condition
-            -> Request a -- ^ the request
-            -> Request a
+reqWhile :: MonadRequest m
+            => (a -> m Bool) -- ^ the condition
+            -> m a -- ^ the request
+            -> m a
 reqWhile cond req = do
   val <- req
   reqIf (cond val)
@@ -613,24 +637,27 @@ reqWhile cond req = do
 Runs the request until the condition given is satisfied, then returns
 the first result that satisfies it. If either request or condition
 return @Notthing@ the result will also be @Nothing@. -}
-reqUntil :: (a -> Request Bool) -- ^ Condition to test.
-            -> Request a -- ^ Request value to evaluate according to test.
-            -> Request a -- ^ Result.
+reqUntil :: MonadRequest m
+            => (a -> m Bool) -- ^ Condition to test.
+            -> m a -- ^ Request value to evaluate according to test.
+            -> m a -- ^ Result.
 reqUntil cond req = reqWhile ((reqLift not) . cond) req
       
 {- |
 Requests a response from user. If @Nothing@ is returned or an
 @"IOError"@ is thrown, assumes default and returns that. -}
-reqDefault :: Request a -- ^ Request to evaluate.
+reqDefault :: MonadRequest m
+              => m a -- ^ Request to evaluate.
               -> a -- ^ Default value.
-              -> Request a -- ^ Result.
+              -> m a -- ^ Result.
 reqDefault req def =
   req <|> makeReq def
 
 {- |
 Ask a request forever -- until failure. -}
-reqForever :: Request a -- ^ Request to ask forever.
-              -> Request a -- ^ Result.
+reqForever :: MonadRequest m
+              => m a -- ^ Request to ask forever.
+              -> m a -- ^ Result.
 reqForever req =
   req >> reqForever req
 
@@ -638,9 +665,10 @@ reqForever req =
 Given a list of items and programs to run, displays a menu
 of the items and runs the selected program. Very low level - usually @reqMenu@
 is used instead. If the user selects an invalid choice, failure occurs. -}
-reqChoices :: [(String, a)] -- ^ List of choices and labels which will be selected from.
-              -> Request Int -- ^ Request which gets the selection from the user.
-              -> Request a -- ^ Result of selection.
+reqChoices :: MonadRequest m
+              => [(String, a)] -- ^ List of choices and labels which will be selected from.
+              -> m Int -- ^ Request which gets the selection from the user.
+              -> m a -- ^ Result of selection.
 reqChoices choices req =
   do
     let choiceCnt = length choices
@@ -655,36 +683,40 @@ reqChoices choices req =
 Takes a list of strings and requests and forms a menu out of them. Menus can
 built using 'reqMenuItem', 'reqSubMenu', 'reqMenuExit', and 'reqMenuEnd'.
 -}
-reqMenu :: [(String, Request a)] -- ^ List of request choices and labels.
-           -> Request a -- ^ Result.
+reqMenu :: MonadRequest m
+           => [(String, m a)] -- ^ List of request choices and labels.
+           -> m a -- ^ Result.
 reqMenu choices =
   do
     choice <- reqChoices choices reqInt
     choice
 
 -- | Used to add an individual entry to a menu that is being built. 
-reqMenuItem :: String -- ^ the label for the selection
-  -> Request a -- ^ the @'Request'@ to run when selected
-  -> [(String, Request a)] -- ^ the menu being built
-  -> [(String, Request a)] -- ^ the resulting menu
+reqMenuItem :: MonadRequest m
+  => String -- ^ the label for the selection
+  -> m a -- ^ the @'Request'@ to run when selected
+  -> [(String, m a)] -- ^ the menu being built
+  -> [(String, m a)] -- ^ the resulting menu
 reqMenuItem label item = (:) (label, item) 
 
 -- | Creates a submenu within a menu. When the submenu exits, control returns to the item specified.
-reqSubMenu :: Request a -- ^ The menu to return to.
+reqSubMenu :: MonadRequest m
+  => m a -- ^ The menu to return to.
   -> String -- ^ The label of the submenu (in the current menu)
-  -> [(String, Request a)] -- ^ The submenu itself
-  -> [(String, Request a)] -- ^ The existing menu into which this submenu will be inserted.
-  -> [(String, Request a)] -- ^ The menu item built and returned.
+  -> [(String, m a)] -- ^ The submenu itself
+  -> [(String, m a)] -- ^ The existing menu into which this submenu will be inserted.
+  -> [(String, m a)] -- ^ The menu item built and returned.
 reqSubMenu prevMenu label subMenu = (:) (label, reqForever $ reqCont (reqMenu subMenu) prevMenu)  
 
 -- | Causes the program to exit from the current menu.  
-reqMenuExit :: String -- ^ the label, e.g.: @\"quit\"@
-  -> [(String, Request a)] -- ^ the menu being built
-  -> [(String, Request a)] -- ^ the resulting menu
+reqMenuExit :: MonadRequest m
+  => String -- ^ the label, e.g.: @\"quit\"@
+  -> [(String, m a)] -- ^ the menu being built
+  -> [(String, m a)] -- ^ the resulting menu
 reqMenuExit label = (:) (label, reqFail)
 
 -- | Ends a list of menu item definitions.
-reqMenuEnd :: [(String, Request a)]
+reqMenuEnd :: MonadRequest m => [(String, m a)]
 reqMenuEnd = []
 
 {- |
@@ -692,9 +724,10 @@ Executes the request given and, if a failure value occurs, executes
 the @"Bool"@ request given (usually some sort of prompt asking if they
 want to quit). If the answer is @True@, the failure value
 propagates. Otherwise, the initial request is run again. -}
-reqConfirm :: Request Bool -- ^ When evaluated, determines if the failure is allowed to proceed or not.
-  -> Request a -- ^ The request to run and to watch for failure
-  -> Request a -- ^ Result of the request (if it did not fail).
+reqConfirm :: MonadRequest m
+  => m Bool -- ^ When evaluated, determines if the failure is allowed to proceed or not.
+  -> m a -- ^ The request to run and to watch for failure
+  -> m a -- ^ Result of the request (if it did not fail).
 reqConfirm conf req = req <|> reqIf conf
   reqFail
   (reqConfirm conf req)
@@ -704,23 +737,21 @@ Takes an initial value and function which produces a request
 from that value. Applies the function to the initial value
 and then recurses. Useful for functions which operate off their
 own output (e.g. a shell maintaining an environment). -}
-reqIterate :: (a -> Request a) -- ^ Iterative function which transforms a to Request a.
+reqIterate :: MonadRequest m
+              => (a -> m a) -- ^ Iterative function which transforms a to Request a.
               -> a -- ^ Initial value used.
-              -> Request a -- ^ Result of evaulation.
+              -> m a -- ^ Result of evaulation.
 reqIterate f x = f x >>= reqIterate f
 
 {- |
 Takes a request and a "continuation" request. If the first request
 results in @Nothing@ or an @"IOError"@ is thrown, run the second
 request.  In either case, return the result of the successful request. -}
-reqCont :: Request a -- ^ First request to evaluate.
-           -> Request a -- ^ Continuation request which is evaluated if first fails.
-           -> Request a -- ^ Result.
-reqCont req cont = Request $ do
-  req' <- catch (runRequest req) (\(_ :: IOError) -> return Nothing)
-  case req' of
-    Nothing -> runRequest cont
-    Just x  -> return $ Just x
+reqCont :: MonadRequest m
+           => m a -- ^ First request to evaluate.
+           -> m a -- ^ Continuation request which is evaluated if first fails.
+           -> m a -- ^ Result.
+reqCont = (<|>)
 
 {- |
 Indicates if the request failed or succceeded. If @"Left" ()@ is
@@ -728,18 +759,20 @@ returned, the request failed. If @"Right" v@ is returned, the request
 produced a value. Though the value returned is itself a request, it
 will always be valid. An @"IOError"@ being thrown by the original
 request is considered a failire.-}
-reqWhich :: Request a -- ^ Request to evaluate.
-            -> Request (Either () a) -- ^ Result.
+reqWhich :: MonadRequest m
+            => m a -- ^ Request to evaluate.
+            -> m (Either () a) -- ^ Result.
 reqWhich req = fmap Right req <|> return (Left ())
 
 {- |
 Give a function from @a -> b@, an initial value, and a @'Request'@ for
 @a@, builds a @'Request'@ for @b@. When @('Request' a)@ fails, then
 the function returns whatever @('Request' b)@ has been built. -}
-reqFoldl :: (a -> b -> Request b) -- ^ Accumulating function.
+reqFoldl :: MonadRequest m
+            => (a -> b -> m b) -- ^ Accumulating function.
             -> b -- ^ Initial value.
-            -> Request a -- ^ Request to evaluate.
-            -> Request b -- ^ Result.
+            -> m a -- ^ Request to evaluate.
+            -> m b -- ^ Result.
 reqFoldl f x req = result <|> return x where
   result = do
     reqVal <- req
@@ -748,24 +781,25 @@ reqFoldl f x req = result <|> return x where
 {- |
 Given a request, builds a list of response. When
 the user enters @Nothing@, the list building ends -}
-reqList :: Request a -- ^ Request to evaluate.
-           -> Request [a] -- ^ Result.
+reqList :: MonadRequest m
+           => m a -- ^ Request to evaluate.
+           -> m [a] -- ^ Result.
 reqList req = reqFoldl (\l ls -> return (l:ls)) [] req
 
 {- |
 Prints a message and makes a request. If the message ends in a space, it is assumed
 that the user should enter values on the same line. Otherwise, a new line is printed
 and the reqeust is evaulated. -}
-prompt :: String -- ^ Message to display. 
-          -> Request a -- ^ Request which gathers input
-          -> Request a -- ^ Result.
-prompt msg (Request req) =
-  Request $
+prompt :: MonadRequest m
+          => String -- ^ Message to display. 
+          -> m a -- ^ Request which gathers input
+          -> m a -- ^ Result.
+prompt msg req =
   do
-    if isSpace (last msg)
+    liftIO $ if isSpace (last msg)
       then putStr msg
       else putStrLn msg
-    hFlush stdout
+    liftIO $ hFlush stdout
     val <- req
     return val
 
@@ -773,10 +807,11 @@ prompt msg (Request req) =
 Displays a message prompt and a default choice in a common way. If
 the user doesn't provide a choice or enters bad data, the default value provided
 is returned. Otherwise, the value entered is returned. -}
-prompt1 :: (Show a) => String -- ^ Message to display. Follows conventions of 'prompt'.
-                     -> Request a -- ^ Request to evaluate.
+prompt1 :: (MonadRequest m, Show a)
+                     => String -- ^ Message to display. Follows conventions of 'prompt'.
+                     -> m a -- ^ Request to evaluate.
                      -> a -- ^ Default value to use if necessary. 
-                     -> Request a -- ^ Result.
+                     -> m a -- ^ Result.
 prompt1 msg req def =
   let msgWithDefault = msg ++ " [" ++ show def ++ "] "
   in
@@ -784,7 +819,7 @@ prompt1 msg req def =
 
 {- |
 Deprecated name for 'prompt1'. -}
-promptWithDefault :: (Show a) => String -> Request a -> a -> Request a 
+promptWithDefault :: (MonadRequest m, Show a) => String -> m a -> a -> m a
 promptWithDefault = prompt1
 
 {- |
@@ -792,10 +827,11 @@ Prints a message, displays defaults (if any), and
 turns a @Request String@ into a @Request Bool@. If
 a default value is provided, it will be returned if the
 user enters nothing or an invalid response. -}
-promptAgree :: String -- ^ Message to display. Follows conventions of 'prompt'.
+promptAgree :: MonadRequest m
+               => String -- ^ Message to display. Follows conventions of 'prompt'.
                -> Maybe Bool -- ^ Default value, if any.
-               -> Request String -- ^ Request which gets a string (usually reqResp).
-               -> Request Bool -- ^ Result.
+               -> m String -- ^ Request which gets a string (usually reqResp).
+               -> m Bool -- ^ Result.
 promptAgree msg def req =
     prompt msgWithDefault (reqAgree def req)
   where
@@ -814,13 +850,13 @@ newtype RandomRequest a = RandomRequest { request :: Request a }
   Just v or Nothing value. -}
 instance (Arbitrary a) => Arbitrary (RandomRequest a) where
   arbitrary =
-    let random val = Request $
+    let random val =
           do
             rnd <- newStdGen
             let (lo, rnd') = randomR (1 :: Int, 10 :: Int) rnd
             if lo > 5
-              then return Nothing
-              else return $ Just val
+              then empty
+              else pure val
     in
       do
         val <- arbitrary
@@ -829,25 +865,19 @@ instance (Arbitrary a) => Arbitrary (RandomRequest a) where
 {- |
 Creates a request which will return a random value or Nothing. The
 request returns the same value every time it is evaluated. -}
-instance (Arbitrary a) => Arbitrary (Request a) where
+instance (Applicative m, Arbitrary a) => Arbitrary (RequestT m a) where
   arbitrary =
     do
       val <- arbitrary
       rnd <- arbitrary
       if rnd
-        then return $ Request (return (Just val))
-        else return $ Request (return Nothing)
+        then pure val
+        else return $ RequestT $ pure Nothing
 
 -- | Show for random requests.  
 instance (Show a) => Show (RandomRequest a) where
-  show (RandomRequest req) = show req
-  
--- | Show for requests.  
-instance (Show a) => Show (Request a) where
-  show = showRequest
-
--- | Show for requests.  
-showRequest (Request r) = "requesting " ++ (show $ unsafePerformIO (r >>= \result -> return result))
+  show (RandomRequest (RequestT req)) =
+    "requesting " ++ show (unsafePerformIO req)
 
 {- |
   Ensures @required@ always returns a @(Just _)@ value. Kind of
@@ -858,7 +888,7 @@ prop_requiredReturns reqRandom =
     unsafePerformIO $
     do
       let req = request reqRandom
-          Request result = required req
+          RequestT result = required req
       ioVal <- result
       case ioVal of
         Nothing -> return False
@@ -871,8 +901,8 @@ prop_reqDefaultReturnsDefault :: Request Integer -> Integer -> Bool
 prop_reqDefaultReturnsDefault req def =
   unsafePerformIO $
     do
-      let Request result = reqDefault req def
-          Request input = req
+      let RequestT result = reqDefault req def
+          RequestT input = req
       inputVal <- input
       Just resultVal <- result
       case inputVal of
@@ -882,10 +912,10 @@ prop_reqDefaultReturnsDefault req def =
 -- | Test that bad choices don't cause exceptions. This test is noisy because it prints 
 -- a lot of garbage to the screen, some of which are bell characters!
 prop_reqChoicesDoesntFail :: [(String, Int)] -> Request Int -> Bool
-prop_reqChoicesDoesntFail choices req@(Request input) =
+prop_reqChoicesDoesntFail choices req@(RequestT input) =
   unsafePerformIO $
     do
-      let Request result = reqChoices choices req
+      let RequestT result = reqChoices choices req
       inputVal <- input
       resultVal <- result
       case inputVal of
@@ -905,10 +935,10 @@ prop_reqChoicesDoesntFail choices req@(Request input) =
   Test that the @andMaybe@ function works as specified. Good test because
   \>\>= is implemented using it! -}
 prop_andMaybeWorks :: Request Int -> Request Int -> Bool
-prop_andMaybeWorks first@(Request firstReq) second@(Request secondReq) =
+prop_andMaybeWorks first@(RequestT firstReq) second@(RequestT secondReq) =
   unsafePerformIO $
     do
-      let Request resultReq = first `andMaybe` \v -> second
+      let RequestT resultReq = first `andMaybe` \v -> second
       resultVal <- resultReq
       firstVal <- firstReq
       secondVal <- secondReq
@@ -921,10 +951,10 @@ prop_andMaybeWorks first@(Request firstReq) second@(Request secondReq) =
 
 -- | Ensure that @reqWhich@ works as expected
 prop_reqWhichWorks :: Request Int -> Bool
-prop_reqWhichWorks req@(Request inputReq) =
+prop_reqWhichWorks req@(RequestT inputReq) =
   unsafePerformIO $
     do
-      let Request resultReq = reqWhich req
+      let RequestT resultReq = reqWhich req
       resultVal <- resultReq
       inputVal <- inputReq
       case resultVal of
@@ -934,10 +964,10 @@ prop_reqWhichWorks req@(Request inputReq) =
 
 -- | Ensure that @reqMaybe@ works as expected.
 prop_reqMaybeWorks :: Request Int -> Request Int -> Bool
-prop_reqMaybeWorks first@(Request firstReq) def@(Request defaultReq) =
+prop_reqMaybeWorks first@(RequestT firstReq) def@(RequestT defaultReq) =
   unsafePerformIO $
     do
-      let Request resultReq = reqMaybe first def (return . id)
+      let RequestT resultReq = reqMaybe first def (return . id)
           compareMaybes n = maybe False (\v -> n == v)
       firstVal <- firstReq
       defaultVal <- defaultReq

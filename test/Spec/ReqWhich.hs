@@ -5,9 +5,9 @@ import Test.HUnit
 import System.Console.HCL
 
 tests = TestLabel "reqWhich" $ TestList $ map test'
-  [ ( "success", makeReq (),        Right () )
-  , ( "failire", reqFail,           Left ()  )
-  , ( "error",   Request $ fail "", Left ()  )
+  [ ( "success", makeReq (),         Right () )
+  , ( "failire", reqFail,            Left ()  )
+  , ( "error",   RequestT $ fail "", Left ()  )
   ]
 
 test' (label, x, expect) = TestLabel label $ TestCase $ do
