@@ -17,7 +17,7 @@ catchTest = TestLabel "catch" $ TestCase $ do
     \(_ :: TestException) -> return True
   assertEqual "" (Just True) val
 
-noThrowTest = TestLabel "catch" $ TestCase $ do
+noThrowTest = TestLabel "no throw" $ TestCase $ do
   val <- runRequest $ catch (return False) $
     \(_ :: TestException) -> return True
   assertEqual "" (Just False) val
