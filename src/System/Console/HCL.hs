@@ -308,10 +308,10 @@ import System.IO.Unsafe (unsafePerformIO)
 import System.Random
 import Data.Maybe (isNothing, isJust)
 import Control.Applicative (Alternative (..))
-import Control.Exception (catch, IOException)
+import Control.Exception (IOException)
 import Control.Monad (when, MonadPlus)
 import Control.Monad.Trans 
-import qualified Control.Monad.Catch as C
+import Control.Monad.Catch (MonadCatch (catch), MonadThrow (throwM))
 
 {- |
 The @Request@ data type represents a value requested interactively. The
@@ -412,13 +412,13 @@ reqIO io = Request $ catch (fmap Just io) $
   \(_ :: IOException) -> return Nothing
 
 -- | Allow throwing exceptions compatible with the exceptions package
-instance C.MonadThrow Request where
-  throwM = Request . C.throwM
+instance MonadThrow Request where
+  throwM = Request . throwM
 
 -- | Allow catching exceptions compatible with the exceptions package
-instance C.MonadCatch Request where
+instance MonadCatch Request where
   catch happy exceptional =
-    Request $ C.catch (runRequest happy) $ runRequest . exceptional
+    Request $ catch (runRequest happy) $ runRequest . exceptional
 
 {- |
 Lifts a @"Maybe" a@ into a @'Request' a@. -}
